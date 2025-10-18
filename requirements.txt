@@ -1,0 +1,8 @@
+python-telegram-bot==20.*
+sentence-transformers
+transformers
+numpy
+fastapi
+uvicorn
+pandas
+python-dotenv
