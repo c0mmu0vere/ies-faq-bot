@@ -1,16 +1,11 @@
-# Entorno virtual
+# venv y entorno
 venv/
+.env
+scripts/env.sh
+
+# modelos/índices y logs
+models/*.faiss
+models/*.pkl
+logs/
 __pycache__/
 *.pyc
-
-# Datos y logs
-data/*.pkl
-data/*.npy
-logs/
-
-# Config local o credenciales
-.env
-*.env
-
-# Archivos de sistema
-.DS_Store
