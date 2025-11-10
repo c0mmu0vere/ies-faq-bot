@@ -1,6 +1,7 @@
-fastapi
-uvicorn
+fastapi>=0.110
+uvicorn>=0.29 
 pandas
 faiss-cpu
 sentence-transformers
 python-multipart
+python-telegram-bot>=20.6
