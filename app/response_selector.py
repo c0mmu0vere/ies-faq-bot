@@ -4,6 +4,23 @@ import math
 import json
 from pathlib import Path
 from datetime import datetime
+from app.generator import get_backend_name
+import re
+
+_STOP_ES = {"de","la","el","los","las","y","o","u","en","del","al","para","por","con","un","una","que","es","son","se","a","lo"}
+
+def _token_set(s: str):
+    toks = re.findall(r"\w+", s.lower(), flags=re.UNICODE)
+    return {t for t in toks if t not in _STOP_ES and len(t) > 1}
+
+def jaccard(a: str, b: str) -> float:
+    A = _token_set(a)
+    B = _token_set(b)
+    if not A or not B:
+        return 0.0
+    inter = len(A & B)
+    union = len(A | B)
+    return inter / union
 
 # Si querés desactivar la rama generativa mientras probamos:
 try:
@@ -53,14 +70,24 @@ def _append_log(payload: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-
-def _build_disambiguation_message(cands: List[Dict[str, Any]], cfg: SelectorConfig) -> str:
-    opciones = []
-    limit = min(len(cands), cfg.show_k)
-    for i in range(limit):
-        opciones.append(cfg.tie_option_format.format(i=i+1, pregunta=cands[i]["pregunta_faq"]))
-    return f"{cfg.tie_msg_prefix}\n" + "\n".join(opciones)
-
+def _build_disambiguation_message(cands, cfg):
+    """
+    Fallback de tie-break SIN LLM:
+    - Redacta una pregunta breve y natural
+    - Muestra 2–3 opciones con bullets
+    """
+    show_k = getattr(cfg, "show_k", 3)
+    opts_src = cands[:show_k]
+    opts = "\n".join(
+        f"- {c.get('pregunta_faq','')}"
+        for c in opts_src
+        if isinstance(c, dict) and c.get("pregunta_faq")
+    )
+    return (
+        "¿Podrías aclarar tu consulta?\n\n"
+        "Por favor, respóndeme con alguna de estas opciones:\n"
+        f"{opts}"
+    )
 
 def _build_fallback_message(cands: List[Dict[str, Any]], cfg: SelectorConfig) -> str:
     sugerencias = []
@@ -159,19 +186,84 @@ def seleccionar_respuesta(
             "tau_high": cfg.tau_high,
             "used_generator": used_gen,
             "ranking": top_k,
+            "generator_backend": get_backend_name() if used_gen else None
         }
         _append_log({"query": query, "mode": "tie-break", "meta": meta})
         return {"mode": "tie-break", "answer": answer, "meta": meta}
 
-    # 3) Generative (polish) — zona intermedia
+    # 3) Generative (polish) — zona intermedia con gate léxico
     if cfg.tau_low <= best_dense < cfg.tau_high:
+        # Gate léxico para evitar polish cuando la consulta y el top1 difieren demasiado
+        lex_overlap = jaccard(query, top1["pregunta_faq"])
+        MIN_JACCARD = 0.22  # ajustar 0.20–0.25 si hace falta
+
+        if lex_overlap < MIN_JACCARD:
+            # Preferimos aclaración (tie-break) antes que pulir algo potencialmente distinto
+            show_k = getattr(cfg, "show_k", 3)
+            opts_src = top_k[:show_k]
+            contexto = [
+                {"pregunta_faq": c["pregunta_faq"], "respuesta": c["respuesta"]}
+                for c in opts_src
+            ]
+
+            used_gen = False
+            clarify_text = None
+            if enable_generation and HAS_GENERATOR:
+                try:
+                    ctx_str = json.dumps(contexto, ensure_ascii=False)
+                    clarify_text = rewrite_answer(
+                        query=query,
+                        base_answer="",
+                        context=ctx_str,
+                        mode="clarify",
+                    )
+                    used_gen = True if (clarify_text and clarify_text.strip()) else False
+                except Exception:
+                    clarify_text = None
+                    used_gen = False
+
+            if not clarify_text:
+                opts = "\n".join(f"- {c['pregunta_faq']}" for c in opts_src)
+                clarify_text = (
+                    "¿Podrías aclarar tu consulta?\n\n"
+                    "Por favor, respóndeme con alguna de estas opciones:\n"
+                    f"{opts}"
+                )
+
+            meta = {
+                "decision": "tie-break",
+                "reason": "low_lexical_overlap_for_polish",
+                "best_dense": best_dense,
+                "second_dense": second_dense,
+                "delta_dense": best_dense - second_dense,
+                "lex_jaccard": lex_overlap,
+                "tau_low": cfg.tau_low,
+                "tau_high": cfg.tau_high,
+                "near_tie_delta": getattr(cfg, "near_tie_delta", None),
+                "used_generator": used_gen,
+                "generator_backend": get_backend_name() if used_gen else None,
+                "top1_faq": top1["pregunta_faq"],
+                "top1_fused": best_fused,
+                "ranking": top_k,
+            }
+            _append_log({"query": query, "mode": "tie-break", "meta": meta})
+            return {"mode": "tie-break", "answer": clarify_text, "meta": meta}
+
+        # Si pasa el gate, hacemos polish normal (prosa natural)
         used_gen = False
         answer = top1["respuesta"]  # si el LLM falla, devolvemos esto
         if enable_generation and HAS_GENERATOR:
-            contexto = [{"pregunta_faq": c["pregunta_faq"], "respuesta": c["respuesta"]} for c in top_k]
             try:
-                ctx_str = json.dumps(contexto, ensure_ascii=False)
-                polished = rewrite_answer(query=query, base_answer=top1["respuesta"], context=ctx_str, mode="polish")
+                ctx_str = json.dumps(
+                    [{"pregunta_faq": c["pregunta_faq"], "respuesta": c["respuesta"]} for c in top_k],
+                    ensure_ascii=False
+                )
+                polished = rewrite_answer(
+                    query=query,
+                    base_answer=top1["respuesta"],
+                    context=ctx_str,
+                    mode="polish",
+                )
                 if polished and polished.strip():
                     answer = polished.strip()
                     used_gen = True
@@ -182,15 +274,20 @@ def seleccionar_respuesta(
             "decision": "generative",
             "best_dense": best_dense,
             "second_dense": second_dense,
+            "delta_dense": best_dense - second_dense,
+            "lex_jaccard": lex_overlap,
             "top1_faq": top1["pregunta_faq"],
             "top1_fused": best_fused,
             "tau_low": cfg.tau_low,
             "tau_high": cfg.tau_high,
+            "near_tie_delta": getattr(cfg, "near_tie_delta", None),
             "used_generator": used_gen,
+            "generator_backend": get_backend_name() if used_gen else None,
             "ranking": top_k,
         }
         _append_log({"query": query, "mode": "generative", "meta": meta})
         return {"mode": "generative", "answer": answer, "meta": meta}
+
 
     # 3b) Generative borderline (laboral cercano a tau_low)
     q_lower = (query or "").lower()
@@ -222,6 +319,7 @@ def seleccionar_respuesta(
             "tau_high": cfg.tau_high,
             "used_generator": used_gen,
             "ranking": top_k,
+            "generator_backend": get_backend_name() if used_gen else None
         }
         _append_log({"query": query, "mode": "generative", "meta": meta})
         return {"mode": "generative", "answer": answer, "meta": meta}

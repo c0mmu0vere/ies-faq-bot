@@ -9,3 +9,5 @@ models/*.pkl
 logs/
 __pycache__/
 *.pyc
+# Local env (no commitear)
+scripts/env.openai.sh

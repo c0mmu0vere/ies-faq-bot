@@ -5,3 +5,4 @@ faiss-cpu
 sentence-transformers
 python-multipart
 python-telegram-bot>=20.6
+openai
